@@ -3,9 +3,7 @@
 #include <v1model.p4>
 
 const bit<16> TYPE_IPV4 = 0x800;
-const bit<16> TYPE_DUP_ID = 0x1212;
-const bit<16> TYPE_RCV_INFO = 0x1213;
-const bit<16> TYPE_SND_INFO = 0x1214;
+const bit<16> TYPE_RDH = 0x1212;
 
 /*************************************************************************
 *********************** H E A D E R S  ***********************************
@@ -36,35 +34,34 @@ header ipv4_t {
     ip4Addr_t dstAddr;
 }
 
-header dup_id_t {
-    bit<8> isDup;
-    bit<8> ackNum;
-}
-
-header rcv_cpuInfo_t {
+header RDH_t {
+    bit<2> name;
+    bit<6> isDup;
     bit<8> ackNum;
     bit<8> packetNum;
-}
-
-header snd_cpuInfo_t {
-    bit<8> ackNum;
-    bit<8> packetNum;
+    bit<8> CPUackNum;
+    bit<8> CPUpacketNum;
+    bit<8> CPUvalidNum;
+    bit<8> isRCV;
 }
 
 struct metadata {
-    /* empty */
+    bit<8> pkt_tx_counter_reg;
+    bit<8> pkt_tx_ack_reg;    
+    bit<8> pkt_rx_counter_reg;
+    bit<8> pkt_rx_valid_reg;
+    bit<8> pkt_rx_ack_reg;
 }
+
 
 struct headers {
     ethernet_t  ethernet;
     ipv4_t      ipv4;
-    dup_id_t    dup_id;
-    rcv_cpuInfo_t   rcvCpuInfo;
-    snd_cpuInfo_t   sndCpuInfo;
+    RDH_t       RDH;
 }
 
 /*************************************************************************
-*********************** P A R S E R  ***********************************
+*********************** P A R S E R  *************************************
 *************************************************************************/
 
 parser MyParser(packet_in packet,
@@ -76,13 +73,13 @@ parser MyParser(packet_in packet,
         packet.extract(hdr.ethernet);
         transition select(hdr.ethernet.etherType) {
             TYPE_IPV4: parse_ipv4;
-            TYPE_DUP_ID: parse_dup_id;
+            TYPE_RDH: parse_RDH;
             default: accept;
         }
     }
 
-    state parse_dup_id {
-        packet.extract(hdr.dup_id);
+    state parse_RDH {
+        packet.extract(hdr.RDH);
         transition parse_ipv4;
     }
 
@@ -98,7 +95,7 @@ parser MyParser(packet_in packet,
 
 
 /*************************************************************************
-************   C H E C K S U M    V E R I F I C A T I O N   *************
+************   C H E C K S U M    V E R I F I C A T I O N   **************
 *************************************************************************/
 
 control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
@@ -126,7 +123,7 @@ control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
 
 
 /*************************************************************************
-**************  I N G R E S S   P R O C E S S I N G   *******************
+**************  I N G R E S S   P R O C E S S I N G   ********************
 *************************************************************************/
 
 control MyIngress(inout headers hdr,
@@ -141,18 +138,23 @@ control MyIngress(inout headers hdr,
     // count ack packet num
     register<bit<8>>(1) pkt_rx_valid_reg;
     // record ack and check one packet is redundent
-    register<bit<8>>(1) pkt_rx_ack_reg;    
-    
-    
+    register<bit<8>>(1) pkt_rx_ack_reg;
+
     /* ------ action ------ */
     action drop() {
         mark_to_drop(standard_metadata);
     }
 
-    action add_tx_counter(bit <8> num) {
+    action ipv4_forward(macAddr_t dstAddr, egressSpec_t port) {
+        standard_metadata.egress_spec = port;
+        hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
+        hdr.ethernet.dstAddr = dstAddr;
+    }
+
+    action add_tx_counter(bit <6> num) {
         bit<8> count;
         pkt_tx_counter_reg.read(count, 0);
-        pkt_tx_counter_reg.write(0, count + num);
+        pkt_tx_counter_reg.write(0, count + (bit<8>)num);
     }
 
     action add_tx_ack() {
@@ -160,6 +162,7 @@ control MyIngress(inout headers hdr,
         pkt_tx_ack_reg.read(count, 0);
         pkt_tx_ack_reg.write(0, count + 1);
     }
+
 
     action add_rx_counter() {
         bit<8> count;
@@ -173,21 +176,12 @@ control MyIngress(inout headers hdr,
         pkt_rx_valid_reg.write(0, valid + 1);
     }
 
-    action handle_rx(inout bit<2>isDuplicated,inout bit<8> tx_ack) {
-        bit<8> rx_ack;
-        pkt_rx_ack_reg.read(rx_ack, 0);
-        if(tx_ack > rx_ack || rx_ack >= 250 && tx_ack < 2) {
-            isDuplicated = 0;
-        }
-        else {
-            isDuplicated = 1;
-        }
-    }
-
     action isRCVReturnInfo(inout bit<2> isReturn) {
         bit<8> rx_ack;
         pkt_rx_ack_reg.read(rx_ack, 0);
-        if(standard_metadata.instance_type == 0 && (rx_ack == 0 || ( 0 < rx_ack && rx_ack<5 && rx_ack > 16))) {
+
+        if(standard_metadata.instance_type == 0 &&
+            (rx_ack == 0 || ( 0 < rx_ack && rx_ack<5 && rx_ack > 60))) {
             isReturn = 1;
         }
         else {
@@ -206,32 +200,32 @@ control MyIngress(inout headers hdr,
         }
     }
 
-    action insert_dupHeader(bit<8> dup_rate){
-        bit<8> count;
-        pkt_tx_ack_reg.read(count, 0);
-        hdr.dup_id.isDup = dup_rate;
-        hdr.dup_id.ackNum = count;
-    }
-
-
-
-
     action insert_rx_cpuInfo() {
-        hdr.rcvCpuInfo.ackNum = 0;
-        hdr.rcvCpuInfo.packetNum = 0;
-
+        hdr.RDH.CPUackNum = 0;
+        hdr.RDH.CPUpacketNum = 0;
     }
 
     action insert_tx_cpuInfo() {
-        hdr.sndCpuInfo.ackNum = 0;
-        hdr.sndCpuInfo.packetNum = 0;
+        hdr.RDH.CPUackNum = 0;
+        hdr.RDH.CPUpacketNum = 0;
     }
 
-    action ipv4_forward(macAddr_t dstAddr, egressSpec_t port) {
-        hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
-        hdr.ethernet.dstAddr = dstAddr;
-        standard_metadata.egress_spec = port;
-        hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+    action handle_rx(inout bit<2>isDuplicated,inout bit<8> tx_ack) {
+        bit<8> rx_ack;
+        pkt_rx_ack_reg.read(rx_ack, 0);
+        if(tx_ack > rx_ack || rx_ack >= 250 && tx_ack < 2) {
+            isDuplicated = 0;
+        }
+        else{
+            isDuplicated = 1;
+        }
+    }
+
+    action insert_dupHeader(bit<6> dup_rate){
+        bit<8> count;
+        pkt_tx_ack_reg.read(count, 0);
+        hdr.RDH.isDup = dup_rate;
+        hdr.RDH.ackNum = count;
     }
 
     action multicast(bit<16> mcast_grp_id) {
@@ -243,17 +237,19 @@ control MyIngress(inout headers hdr,
     }
 
 
+
+
     table ipv4_lpm {
-        key = {
-            hdr.ipv4.dstAddr: lpm;
-        }
         actions = {
             ipv4_forward;
             drop;
-            NoAction;
         }
-        size = 1024;
-        default_action = NoAction();
+
+        key = {
+            hdr.ipv4.dstAddr: lpm;
+        }
+        size = 512;
+        const default_action = drop();
     }
 
     table dup_rate_table {
@@ -269,7 +265,7 @@ control MyIngress(inout headers hdr,
 
     table dup_multicast {
         key = {
-            hdr.dup_id.isDup: exact;
+            hdr.RDH.isDup: exact;
             standard_metadata.ingress_port: exact;
         }
 
@@ -281,87 +277,77 @@ control MyIngress(inout headers hdr,
         default_action = NoAction();
     }
 
-    apply {
-        log_msg("Ingress pipeline: Processing packet");
-        if (hdr.ethernet.etherType == TYPE_DUP_ID) {
-            // add raw packet num
+    apply{
+        hdr.RDH.setValid();
+        if (hdr.ethernet.etherType == TYPE_RDH) {
             add_rx_counter();
 
-            // check packet is duplicated
             bit<2> ackIsDup = 0;
-            handle_rx(ackIsDup, hdr.dup_id.ackNum);
-            if(ackIsDup == 1) {
-                drop();
-            }
+            handle_rx(ackIsDup, hdr.RDH.ackNum);
+            if(ackIsDup == 1)  drop(); 
             else {
-                // add pkt_rx_valid_reg
                 add_rx_valid();
-                // update ack number
-                pkt_rx_ack_reg.write(0, hdr.dup_id.ackNum);
-                hdr.dup_id.setInvalid();
+                pkt_rx_ack_reg.write(0, hdr.RDH.ackNum);
                 hdr.ethernet.etherType = TYPE_IPV4;
-                
-                // return info to controller (CPU)
-                hdr.rcvCpuInfo.setValid();
-                insert_rx_cpuInfo();
+                hdr.RDH.setInvalid();
                 clone3(CloneType.I2E,100, meta);
-                
             }
         }
         else {
-            hdr.dup_id.setValid();
             dup_rate_table.apply();
             add_tx_ack();
-            add_tx_counter(hdr.dup_id.isDup);
+            add_tx_counter(hdr.RDH.isDup);
             dup_multicast.apply();
-            hdr.ethernet.etherType = TYPE_DUP_ID;
-
-            // return info to controller (CPU)
-            hdr.sndCpuInfo.setValid();
-            insert_tx_cpuInfo();
+            hdr.ethernet.etherType = TYPE_RDH;
             clone3(CloneType.I2E,100, meta);
-            
+            // p4_logger(hdr.RDH.isDup);
         }
+        
+        pkt_tx_counter_reg.read(meta.pkt_tx_counter_reg, 0);
+        pkt_tx_ack_reg.read(meta.pkt_tx_ack_reg, 0);
+        pkt_rx_counter_reg.read(meta.pkt_rx_counter_reg, 0);
+        pkt_rx_valid_reg.read(meta.pkt_rx_valid_reg, 0);
+        pkt_rx_ack_reg.read(meta.pkt_rx_ack_reg, 0);
+
         ipv4_lpm.apply();
     }
 }
 
 /*************************************************************************
-****************  E G R E S S   P R O C E S S I N G   *******************
+****************  E G R E S S   P R O C E S S I N G   ********************
 *************************************************************************/
 
 control MyEgress(inout headers hdr,
                  inout metadata meta,
                  inout standard_metadata_t standard_metadata) {
-    apply {
-        if (standard_metadata.instance_type == 1 ){
-            if(hdr.ethernet.etherType == TYPE_DUP_ID) {
-                hdr.ethernet.etherType = TYPE_SND_INFO;
-                hdr.dup_id.setInvalid();
-            }
-            else {
-                hdr.ethernet.etherType = TYPE_RCV_INFO;
-                hdr.dup_id.setInvalid();
+                    
+    apply{
+        if(hdr.ethernet.etherType == TYPE_IPV4) {
+            // 有兩個封包經過這裡
+            if(standard_metadata.instance_type == 1) {
+                hdr.RDH.setValid();
+                hdr.ethernet.etherType = TYPE_RDH;
+                hdr.RDH.CPUpacketNum = meta.pkt_tx_counter_reg;
+                hdr.RDH.CPUackNum = meta.pkt_tx_ack_reg;
             }
         }
-        else {
-            if(hdr.ethernet.etherType == TYPE_DUP_ID) {
-                hdr.sndCpuInfo.setInvalid();
-            }
-            else {
-                hdr.rcvCpuInfo.setInvalid();
+        else if (hdr.ethernet.etherType == TYPE_RDH) {
+            hdr.RDH.setValid();
+            hdr.RDH.CPUpacketNum = meta.pkt_rx_counter_reg;
+            hdr.RDH.CPUvalidNum = meta.pkt_rx_valid_reg;
+            hdr.RDH.CPUackNum = meta.pkt_rx_ack_reg;
+            // 有一個封包經過這裡 (standard_metadata.instance_type == 5)
+            // p4_logger(standard_metadata.instance_type);
+            if(standard_metadata.instance_type == 0) {
+                mark_to_drop(standard_metadata);
             }
         }
 
-
-        if (standard_metadata.instance_type == 0 && hdr.ethernet.etherType == TYPE_DUP_ID){
-            mark_to_drop(standard_metadata);
-        }
     }
 }
 
 /*************************************************************************
-*************   C H E C K S U M    C O M P U T A T I O N   **************
+*************   C H E C K S U M    C O M P U T A T I O N   ***************
 *************************************************************************/
 
 control MyComputeChecksum(inout headers hdr, inout metadata meta) {
@@ -386,21 +372,19 @@ control MyComputeChecksum(inout headers hdr, inout metadata meta) {
 
 
 /*************************************************************************
-***********************  D E P A R S E R  *******************************
+*************************  D E P A R S E R  ******************************
 *************************************************************************/
 
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         packet.emit(hdr.ethernet);
-        packet.emit(hdr.sndCpuInfo);
-        packet.emit(hdr.rcvCpuInfo);
-        packet.emit(hdr.dup_id);
+        packet.emit(hdr.RDH);
         packet.emit(hdr.ipv4);
     }
 }
 
 /*************************************************************************
-***********************  S W I T C H  *******************************
+****************************  S W I T C H  *******************************
 *************************************************************************/
 
 V1Switch(
